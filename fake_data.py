@@ -8,14 +8,17 @@ import math
 import random
 import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple
 
 MAGIC = 0x54494E53
 LOG_TYPE_GNSS_IMU = 0x0101
+FILE_MAGIC = 0x544C4F47
 
 HEADER_STRUCT = struct.Struct('<I H H Q I')
+FILE_HEADER_STRUCT = struct.Struct('<I H H Q')
 BOOL_STRUCT = struct.Struct('<?')
 DOUBLE_STRUCT = struct.Struct('<d')
 FLOAT_STRUCT = struct.Struct('<f')
@@ -111,13 +114,16 @@ def pack_imu_sample(timestamp_us: int) -> bytes:
     return bytes(payload)
 
 
-def make_record(seq: int, timestamp_us: int, sample: GnssSample) -> Tuple[bytes, bytes]:
+def make_record(seq: int, timestamp_us: int, sample: GnssSample) -> Tuple[bytes, bytes, bytes]:
     payload = bytearray()
     payload.extend(struct.pack('<Q', timestamp_us))
     payload.extend(sample.pack())
     payload.extend(pack_imu_sample(timestamp_us))
-    header = HEADER_STRUCT.pack(MAGIC, LOG_TYPE_GNSS_IMU, len(payload), timestamp_us, seq)
-    return header, bytes(payload)
+    payload_bytes = bytes(payload)
+    header = HEADER_STRUCT.pack(MAGIC, LOG_TYPE_GNSS_IMU, len(payload_bytes), timestamp_us, seq)
+    crc = zlib.crc32(payload_bytes, zlib.crc32(header)) & 0xFFFFFFFF
+    crc_bytes = struct.pack('<I', crc)
+    return header, payload_bytes, crc_bytes
 
 
 def synthesize_records(count: int, start_tow: float, rate_hz: float) -> Iterable[Tuple[bytes, bytes]]:
@@ -160,8 +166,8 @@ def synthesize_records(count: int, start_tow: float, rate_hz: float) -> Iterable
             pps_count_snapshot=idx,
             valid=True,
         )
-        header, payload = make_record(idx, timestamp, gnss)
-        yield header, payload
+        header, payload, crc_bytes = make_record(idx, timestamp, gnss)
+        yield header, payload, crc_bytes
         timestamp += int(dt * 1_000_000)
         tow += dt
 
@@ -180,9 +186,12 @@ def main() -> None:
     args = parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('wb') as f:
-        for header, payload in synthesize_records(args.count, args.start_tow, args.rate):
+        file_header = FILE_HEADER_STRUCT.pack(FILE_MAGIC, 1, FILE_HEADER_STRUCT.size, 0)
+        f.write(file_header)
+        for header, payload, crc_bytes in synthesize_records(args.count, args.start_tow, args.rate):
             f.write(header)
             f.write(payload)
+            f.write(crc_bytes)
     print(f'Wrote {args.count} synthetic records to {args.output}')
 
 
